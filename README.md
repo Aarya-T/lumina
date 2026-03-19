@@ -47,3 +47,4 @@ streamlit run ui/app.py
 - The entrypoint for programmatic use is `main.py`.
 - The Streamlit UI lives in `ui/app.py`.
 
+# lumina
