@@ -1,0 +1,20 @@
+{
+  "name": "Kira",
+  "role": "protagonist",
+  "speech_style": "bold and determined, short punchy sentences",
+  "origin": "japanese manga",
+  "speech_level": "casual masculine",
+  "sample_dialogue": [
+    "I won't lose to anyone!",
+    "No way I'm backing down!",
+    "This is my fight!"
+  ],
+  "forbidden_phrases": [
+    "indeed",
+    "furthermore",
+    "I must say",
+    "one must",
+    "perhaps I shall"
+  ]
+}
+

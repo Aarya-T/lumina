@@ -1,0 +1,10 @@
+{
+  "default_max_chars": 80,
+  "bubbles": {
+    "small": 40,
+    "medium": 80,
+    "large": 120,
+    "thought": 60
+  }
+}
+

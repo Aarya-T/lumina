@@ -1,0 +1,7 @@
+crewai==1.10.1
+groq>=0.5.0
+chromadb>=0.5.0
+streamlit>=1.40.0
+python-dotenv>=1.0.1
+langchain>=0.3.0
+
