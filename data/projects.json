@@ -1,0 +1,34 @@
+{
+  "projects": [
+    {
+      "manga_id": "test",
+      "display_name": "Test",
+      "language": "Japanese",
+      "chapters_completed": []
+    },
+    {
+      "manga_id": "test_case",
+      "display_name": "Test Case",
+      "language": "Japanese",
+      "chapters_completed": [
+        1
+      ]
+    },
+    {
+      "manga_id": "testcase2",
+      "display_name": "testCase2",
+      "language": "Japanese",
+      "chapters_completed": [
+        1
+      ]
+    },
+    {
+      "manga_id": "inzagi",
+      "display_name": "inzagi",
+      "language": "Japanese",
+      "chapters_completed": [
+        1
+      ]
+    }
+  ]
+}

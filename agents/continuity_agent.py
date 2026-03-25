@@ -17,7 +17,11 @@ from groq import Groq
 # Make the project root importable so we can access local packages.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.groq_client import load_environment  # type: ignore
-from memory.vector_store import query_character_profile  # type: ignore
+from memory.vector_store import (
+    query_character_profile,
+    query_character_profile_dict,
+    query_last_approved_lines,
+)  # type: ignore
 
 
 @dataclass
@@ -48,14 +52,23 @@ class ContinuityDirectorAgent:
 MODEL_NAME = "llama-3.3-70b-versatile"
 
 
-def _build_character_prompt_snippet(profile_json: str, character_name: str) -> str:
+def _build_character_prompt_snippet(
+    profile_json_or_dict: str | Dict[str, Any],
+    character_name: str,
+) -> str:
     """
     Build a human-readable snippet describing the character from their JSON profile.
     """
-    try:
-        data = json.loads(profile_json)
-    except json.JSONDecodeError:
-        return f"The character is named {character_name}. No structured profile could be parsed."
+    if isinstance(profile_json_or_dict, dict):
+        data = profile_json_or_dict
+    else:
+        try:
+            data = json.loads(profile_json_or_dict)
+        except json.JSONDecodeError:
+            return (
+                f"The character is named {character_name}. "
+                "No structured profile could be parsed."
+            )
 
     role = data.get("role") or "character"
     speech_style = data.get("speech_style") or ""
@@ -76,7 +89,7 @@ def _build_character_prompt_snippet(profile_json: str, character_name: str) -> s
 
 def run_continuity_director(
     adapted_text: str,
-    character_name: str,
+    character_profile: Dict[str, Any],
     client: Groq,
 ) -> str:
     """
@@ -84,22 +97,42 @@ def run_continuity_director(
 
     Args:
         adapted_text: Output from the Cultural Adaptor Agent.
-        character_name: Name of the speaking character (e.g., 'Kira').
+        character_profile: Full character profile dict (including forbidden phrases, voice rules, etc.).
         client: Initialized Groq client instance.
 
     Returns:
         Dialogue rewritten (if needed) to better fit the character voice.
         If no character profile is found, returns `adapted_text` unchanged.
     """
-    profile_str = query_character_profile(character_name)
-    if profile_str is None:
-        print(
-            f"[ContinuityDirector] No profile found in ChromaDB for '{character_name}'. "
-            "Returning text unchanged."
-        )
+    character_name = (
+        character_profile.get("name")
+        or character_profile.get("character")
+        or ""
+    ).strip()
+    manga_id = str(character_profile.get("manga_id") or "default").strip() or "default"
+    if not character_name:
+        # Defensive fallback for malformed profile dict.
         return adapted_text
 
-    character_snippet = _build_character_prompt_snippet(profile_str, character_name)
+    # Pull recent approved lines to keep consistency across panels.
+    approved_lines = query_last_approved_lines(
+        character_name,
+        manga_id,
+        limit=10,
+    )
+    if approved_lines:
+        approved_lines_formatted = "\n".join(
+            f"- [{row.get('panel_id')}] {row.get('final_output')}"
+            for row in approved_lines
+        )
+    else:
+        approved_lines_formatted = "None available yet."
+
+    # Build voice/constraint snippet from the provided profile dict.
+    character_snippet = _build_character_prompt_snippet(
+        character_profile,
+        character_name,
+    )
 
     system_prompt = (
         "You are a continuity director for a manga/webtoon localization team.\n"
@@ -111,6 +144,8 @@ def run_continuity_director(
         "- Avoid ALL forbidden phrases listed in the character profile.\n"
         "- Preserve the same meaning, emotional content, and cultural adaptation\n"
         "  already present in the input.\n\n"
+        "Recent approved lines for this character (context):\n"
+        f"{approved_lines_formatted}\n\n"
         "Output rules:\n"
         "- Output ONLY the final rewritten dialogue.\n"
         "- Do NOT add explanations, comments, or any extra text.\n"
@@ -128,11 +163,34 @@ def run_continuity_director(
     return continuity_text.strip()
 
 
+def _run_continuity_director_legacy(
+    adapted_text: str,
+    character_name: str,
+    client: Groq,
+) -> str:
+    """
+    Backward-compatible path (used nowhere in the updated pipeline).
+    """
+    profile_str = query_character_profile(character_name, manga_id="default")
+    if profile_str is None:
+        print(
+            f"[ContinuityDirector] No profile found in ChromaDB for '{character_name}'. "
+            "Returning text unchanged."
+        )
+        return adapted_text
+    character_profile = (
+        query_character_profile_dict(character_name, manga_id="default")
+        or {"name": character_name, "manga_id": "default"}
+    )
+    return run_continuity_director(adapted_text, character_profile, client)
+
+
 def grade_continuity_output(
     adapted_text: str,
     continuity_text: str,
     character_name: str,
     client: Groq,
+    manga_id: str = "default",
 ) -> Dict[str, Any]:
     """
     Grade how well the continuity-directed line matches the character and input.
@@ -142,7 +200,7 @@ def grade_continuity_output(
     - forbidden_phrase_compliance (1-10)
     - meaning_preservation (1-10)
     """
-    profile_str = query_character_profile(character_name)
+    profile_str = query_character_profile(character_name, manga_id=manga_id)
     profile_snippet = ""
     if profile_str is not None:
         profile_snippet = _build_character_prompt_snippet(profile_str, character_name)
@@ -248,7 +306,22 @@ def test_continuity_agent() -> None:
     print(adapted_text)
 
     try:
-        continuity_text = run_continuity_director(adapted_text, character_name, client)
+        character_profile = query_character_profile_dict(
+            character_name,
+            manga_id="default",
+        ) or {
+            "name": character_name,
+            "manga_id": "default",
+            "role": "character",
+            "speech_style": "",
+            "forbidden_phrases": [],
+            "speech_rules": [],
+        }
+        continuity_text = run_continuity_director(
+            adapted_text,
+            character_profile,
+            client,
+        )
     except Exception as exc:
         print(f"[ContinuityAgent Test] Error during continuity adjustment: {exc}")
         return

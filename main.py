@@ -2,6 +2,7 @@ from typing import Any, Dict
 
 from groq import Groq
 
+from agents.profile_extractor import extract_profiles, update_or_create_profile
 from agents.cultural_agent import grade_cultural_output, run_cultural_adaptor
 from agents.continuity_agent import (
     grade_continuity_output,
@@ -16,7 +17,13 @@ from agents.typesetting_agent import (
     grade_typesetting_output,
     run_typesetting_editor,
 )
+from memory import vector_store
+from memory.vector_store import (
+    add_approved_line,
+    query_character_profile_dict,
+)
 from utils.groq_client import load_environment
+from utils.project_manager import mark_chapter_complete
 
 # TODO: Import CrewAI orchestration primitives when implementing multi-agent Crew.
 # from crewai import Crew
@@ -114,6 +121,9 @@ def run_pipeline(
     character_name: str,
     bubble_type: str,
     client: Groq,
+    *,
+    bubble_char_limit: int | None = None,
+    character_profile: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """
     Run the full Lumina Pipeline on a single line of script.
@@ -154,11 +164,29 @@ def run_pipeline(
             "pass": True,
         }
 
+    # Resolve character profile once for continuity.
+    if character_profile is None:
+        character_profile = query_character_profile_dict(
+            character_name,
+            manga_id="default",
+        ) or {
+            "name": character_name,
+            "role": "character",
+            "speech_style": "",
+            "forbidden_phrases": [],
+            "speech_rules": [],
+            "manga_id": "default",
+        }
+
     # STEP A — Cultural Adaptation (Agent 1)
     cultural_result = _run_with_retries(
         "Agent 1 (Cultural Adaptor)",
-        run_fn=lambda: run_cultural_adaptor(raw_text, client),
-        grade_fn=lambda adapted: grade_cultural_output(raw_text, adapted, client),
+        run_fn=lambda: run_cultural_adaptor(translated_output, client),
+        grade_fn=lambda adapted: grade_cultural_output(
+            translated_output,
+            adapted,
+            client,
+        ),
     )
     cultural_output = cultural_result["output"]
     cultural_scores = cultural_result["scores"]
@@ -168,7 +196,7 @@ def run_pipeline(
         "Agent 2 (Continuity Director)",
         run_fn=lambda: run_continuity_director(
             cultural_output,
-            character_name,
+            character_profile,
             client,
         ),
         grade_fn=lambda continuity_text: grade_continuity_output(
@@ -188,12 +216,14 @@ def run_pipeline(
             continuity_output,
             bubble_type,
             client,
+            bubble_char_limit=bubble_char_limit,
         ),
         grade_fn=lambda final_text: grade_typesetting_output(
             original=continuity_output,
             final=final_text,
             bubble_type=bubble_type,
             client=client,
+            bubble_char_limit=bubble_char_limit,
         ),
     )
     final_output = typesetting_result["output"]
@@ -214,6 +244,130 @@ def run_pipeline(
         "typesetting_scores": typesetting_scores,
         "status": "complete",
     }
+
+
+def _flagged_from_scores(scores: Dict[str, Any]) -> bool:
+    """
+    Flag True if any numeric score across nested score dicts is < 7.
+    Ignores boolean `pass` fields.
+    """
+
+    def walk(v: Any) -> bool:
+        if isinstance(v, bool):
+            return False
+        if isinstance(v, (int, float)):
+            return v < 7
+        if isinstance(v, dict):
+            return any(walk(x) for x in v.values())
+        if isinstance(v, list):
+            return any(walk(x) for x in v)
+        return False
+
+    return walk(scores)
+
+
+def process_chapter(chapter_data: Dict[str, Any], client: Groq) -> list[Dict[str, Any]]:
+    """
+    Process an uploaded chapter JSON through the 4-step pipeline per panel.
+
+    Returns a list of panel results:
+      - panel_id
+      - original
+      - final_output
+      - scores
+      - flagged
+    """
+    manga_id = str(chapter_data.get("manga_id") or "unknown").strip() or "unknown"
+    chapter = int(chapter_data.get("chapter") or 0)
+
+    panels = chapter_data.get("panels") or []
+
+    # Optional upfront profiling: enrich/merge character voice rules for continuity.
+    try:
+        inferred_profiles = extract_profiles(chapter_data, client)
+        for profile in inferred_profiles:
+            character_name = str(profile.get("name") or "").strip()
+            if not character_name:
+                continue
+            update_or_create_profile(
+                character_name=character_name,
+                new_profile=profile,
+                vector_store=vector_store,
+                manga_id=manga_id,
+            )
+    except Exception as exc:
+        print(f"[ProcessChapter] Profile extraction failed (continuing anyway): {exc}")
+
+    results: list[Dict[str, Any]] = []
+    for panel in panels:
+        if not isinstance(panel, dict):
+            continue
+
+        panel_id = panel.get("panel_id") or panel.get("id") or panel.get("index")
+        panel_id = str(panel_id) if panel_id is not None else ""
+
+        character_name = str(panel.get("character") or "").strip()
+        original = str(panel.get("text") or "")
+        if not character_name or not original:
+            continue
+
+        bubble_char_limit = panel.get("bubble_char_limit")
+        bubble_char_limit = int(bubble_char_limit) if bubble_char_limit is not None else None
+
+        bubble_type = str(panel.get("bubble_type") or "medium").strip()
+
+        character_profile = query_character_profile_dict(
+            character_name,
+            manga_id=manga_id,
+        ) or {
+            "name": character_name,
+            "role": "character",
+            "speech_style": "",
+            "forbidden_phrases": [],
+            "speech_rules": [],
+        }
+        character_profile["manga_id"] = manga_id
+
+        pipeline_result = run_pipeline(
+            raw_text=original,
+            character_name=character_name,
+            bubble_type=bubble_type,
+            client=client,
+            bubble_char_limit=bubble_char_limit,
+            character_profile=character_profile,
+        )
+
+        final_output = pipeline_result.get("final_output", "")
+        scores = {
+            "translation": pipeline_result.get("translation_scores"),
+            "cultural": pipeline_result.get("cultural_scores"),
+            "continuity": pipeline_result.get("continuity_scores"),
+            "typesetting": pipeline_result.get("typesetting_scores"),
+        }
+        flagged = _flagged_from_scores(scores)
+
+        # Store approved output for later continuity.
+        add_approved_line(
+            panel_id=panel_id,
+            character_name=character_name,
+            manga_id=manga_id,
+            original_japanese=original,
+            final_output=final_output,
+            scores=scores,
+        )
+
+        results.append(
+            {
+                "panel_id": panel_id,
+                "original": original,
+                "final_output": final_output,
+                "scores": scores,
+                "flagged": flagged,
+            }
+        )
+
+    mark_chapter_complete(manga_id, chapter)
+    return results
 
 
 def test_full_pipeline() -> None:

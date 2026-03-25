@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+import time
 
 import json
 
@@ -31,6 +32,8 @@ class VectorStoreConfig:
 
     persist_directory: Path
     character_collection_name: str = "character_profiles"
+    approved_lines_collection_name: str = "approved_lines"
+    localization_decisions_collection_name: str = "localization_decisions"
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -42,6 +45,8 @@ DEFAULT_CONFIG = VectorStoreConfig(
 
 _CLIENT: Optional[chromadb.PersistentClient] = None
 _CHARACTER_COLLECTION: Optional[Collection] = None
+_APPROVED_LINES_COLLECTION: Optional[Collection] = None
+_LOCALIZATION_DECISIONS_COLLECTION: Optional[Collection] = None
 
 
 def get_chroma_client(config: VectorStoreConfig = DEFAULT_CONFIG) -> chromadb.PersistentClient:
@@ -86,16 +91,51 @@ def get_character_collection(
     return _CHARACTER_COLLECTION
 
 
-def _character_id_from_name(character_name: str) -> str:
+def get_approved_lines_collection(
+    config: VectorStoreConfig = DEFAULT_CONFIG,
+) -> Collection:
+    """
+    Get or create the ChromaDB collection used for approved panel outputs.
+    """
+    global _APPROVED_LINES_COLLECTION
+
+    if _APPROVED_LINES_COLLECTION is None:
+        client = get_chroma_client(config)
+        _APPROVED_LINES_COLLECTION = client.get_or_create_collection(
+            name=config.approved_lines_collection_name,
+        )
+
+    return _APPROVED_LINES_COLLECTION
+
+
+def get_localization_decisions_collection(
+    config: VectorStoreConfig = DEFAULT_CONFIG,
+) -> Collection:
+    """
+    Get or create the ChromaDB collection used for recurring localization decisions.
+    """
+    global _LOCALIZATION_DECISIONS_COLLECTION
+
+    if _LOCALIZATION_DECISIONS_COLLECTION is None:
+        client = get_chroma_client(config)
+        _LOCALIZATION_DECISIONS_COLLECTION = client.get_or_create_collection(
+            name=config.localization_decisions_collection_name,
+        )
+
+    return _LOCALIZATION_DECISIONS_COLLECTION
+
+
+def _character_id_from_name(manga_id: str, character_name: str) -> str:
     """
     Derive a stable identifier for a character based on their name.
     """
-    return f"character:{character_name.strip().lower()}"
+    return f"{manga_id}::character:{character_name.strip().lower()}"
 
 
 def add_character_profile(
     character_name: str,
     profile_data: Dict[str, Any],
+    manga_id: str,
     *,
     config: VectorStoreConfig = DEFAULT_CONFIG,
 ) -> None:
@@ -105,9 +145,10 @@ def add_character_profile(
     Args:
         character_name: Display name of the character.
         profile_data: Dictionary containing profile details.
+        manga_id: Project/manga identifier used to isolate data.
     """
     collection = get_character_collection(config)
-    character_id = _character_id_from_name(character_name)
+    character_id = _character_id_from_name(manga_id, character_name)
 
     document = json.dumps(profile_data, ensure_ascii=False)
 
@@ -119,8 +160,31 @@ def add_character_profile(
     )
 
 
+def query_character_profile_dict(
+    character_name: str,
+    manga_id: str,
+    *,
+    config: VectorStoreConfig = DEFAULT_CONFIG,
+) -> Optional[Dict[str, Any]]:
+    """
+    Retrieve a character profile from ChromaDB as a Python dict.
+    """
+    raw = query_character_profile(
+        character_name,
+        manga_id,
+        config=config,
+    )
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
 def query_character_profile(
     character_name: str,
+    manga_id: str,
     *,
     config: VectorStoreConfig = DEFAULT_CONFIG,
 ) -> Optional[str]:
@@ -134,7 +198,7 @@ def query_character_profile(
         The stored profile as a JSON string, or None if not found.
     """
     collection = get_character_collection(config)
-    character_id = _character_id_from_name(character_name)
+    character_id = _character_id_from_name(manga_id, character_name)
 
     result = collection.get(ids=[character_id])
 
@@ -149,12 +213,133 @@ def query_character_profile(
     return doc
 
 
-def load_characters_from_json(folder_path: str | Path) -> None:
+def _approved_line_id_from(
+    manga_id: str,
+    panel_id: Any,
+    character_name: str,
+) -> str:
+    """
+    Derive a stable identifier for an approved panel line.
+    """
+    return f"{manga_id}::approved_line:{panel_id}:{character_name.strip().lower()}"
+
+
+def add_approved_line(
+    panel_id: Any,
+    character_name: str,
+    manga_id: str,
+    original_japanese: str,
+    final_output: str,
+    scores: Dict[str, Any],
+    *,
+    config: VectorStoreConfig = DEFAULT_CONFIG,
+) -> None:
+    """
+    Store an approved panel output with metadata for later continuity context.
+    """
+    collection = get_approved_lines_collection(config)
+    approved_id = _approved_line_id_from(manga_id, panel_id, character_name)
+
+    # Use epoch seconds for simple recency ordering.
+    created_at = int(time.time())
+
+    collection.upsert(
+        ids=[approved_id],
+        documents=[final_output],
+        metadatas=[
+            {
+                "panel_id": str(panel_id),
+                "character_name": character_name,
+                "manga_id": manga_id,
+                "original_japanese": original_japanese,
+                "created_at": created_at,
+                "scores_json": json.dumps(scores, ensure_ascii=False),
+            }
+        ],
+    )
+
+
+def query_last_approved_lines(
+    character_name: str,
+    manga_id: str,
+    *,
+    limit: int = 10,
+    config: VectorStoreConfig = DEFAULT_CONFIG,
+) -> List[Dict[str, Any]]:
+    """
+    Retrieve the last approved lines for a character, sorted by created_at.
+    """
+    collection = get_approved_lines_collection(config)
+
+    # Chroma "get" does not guarantee ordering, so we sort after retrieving.
+    result = collection.get(
+        where={
+            "$and": [
+                {"character_name": {"$eq": character_name}},
+                {"manga_id": {"$eq": manga_id}},
+            ]
+        },
+    )
+
+    documents = result.get("documents") or []
+    metadatas = result.get("metadatas") or []
+
+    rows: List[Dict[str, Any]] = []
+    for doc, meta in zip(documents, metadatas):
+        meta = meta or {}
+        rows.append(
+            {
+                "panel_id": meta.get("panel_id"),
+                "original_japanese": meta.get("original_japanese"),
+                "final_output": doc,
+                "created_at": meta.get("created_at", 0),
+            }
+        )
+
+    rows.sort(key=lambda r: int(r.get("created_at") or 0))
+    return rows[-limit:]
+
+
+def upsert_localization_decision(
+    manga_id: str,
+    source_phrase: str,
+    translated_phrase: str,
+    *,
+    context: Optional[str] = None,
+    config: VectorStoreConfig = DEFAULT_CONFIG,
+) -> None:
+    """
+    Store a recurring phrase translation decision.
+    """
+    collection = get_localization_decisions_collection(config)
+    decision_id = f"{manga_id}::decision:{source_phrase.strip().lower()}"
+
+    created_at = int(time.time())
+
+    collection.upsert(
+        ids=[decision_id],
+        documents=[translated_phrase],
+        metadatas=[
+            {
+                "manga_id": manga_id,
+                "source_phrase": source_phrase,
+                "context": context or "",
+                "created_at": created_at,
+            }
+        ],
+    )
+
+
+def load_characters_from_json(
+    folder_path: str | Path,
+    manga_id: str,
+) -> None:
     """
     Load all JSON character profiles from the specified folder into ChromaDB.
 
     Args:
         folder_path: Path to the folder containing `.json` character files.
+        manga_id: Project/manga identifier used to isolate data.
     """
     folder = Path(folder_path)
     if not folder.exists():
@@ -170,7 +355,7 @@ def load_characters_from_json(folder_path: str | Path) -> None:
             continue
 
         character_name = data.get("name") or json_file.stem
-        add_character_profile(character_name, data)
+        add_character_profile(character_name, data, manga_id)
         print(f"[VectorStore] Loaded character profile: {character_name}")
 
 
@@ -184,9 +369,9 @@ def test_vector_store() -> None:
     - Print the result for manual inspection.
     """
     characters_folder = PROJECT_ROOT / "data" / "characters"
-    load_characters_from_json(characters_folder)
+    load_characters_from_json(characters_folder, manga_id="default")
 
-    profile_str = query_character_profile("Kira")
+    profile_str = query_character_profile("Kira", manga_id="default")
     if profile_str is None:
         print("[VectorStore Test] Failed to retrieve profile for 'Kira'.")
         return

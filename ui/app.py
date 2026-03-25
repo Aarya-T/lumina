@@ -20,8 +20,9 @@ import streamlit as st
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from main import run_pipeline  # type: ignore
+from main import process_chapter  # type: ignore
 from memory.vector_store import load_characters_from_json  # type: ignore
+from utils.project_manager import create_project, load_projects  # type: ignore
 
 
 @st.cache_resource
@@ -91,7 +92,17 @@ def _load_characters_on_startup() -> None:
     Load all character profiles into ChromaDB.
     """
     characters_folder = PROJECT_ROOT / "data" / "characters"
-    load_characters_from_json(characters_folder)
+    load_characters_from_json(characters_folder, manga_id="default")
+
+
+@st.cache_resource
+def _load_characters_for_manga(manga_id: str) -> None:
+    """
+    Load character profiles into ChromaDB for a specific manga/project.
+    Cached to avoid re-loading on every rerun.
+    """
+    characters_folder = PROJECT_ROOT / "data" / "characters"
+    load_characters_from_json(characters_folder, manga_id=manga_id)
 
 
 def _results_tabs(raw_text: str, result: Dict[str, Any]) -> None:
@@ -253,59 +264,174 @@ def _results_tabs(raw_text: str, result: Dict[str, Any]) -> None:
 
 def main() -> None:
     _init_page()
+    st.divider()
+    st.sidebar.header("📚 Lumina Projects")
+
+    if "selected_project_manga_id" not in st.session_state:
+        st.session_state["selected_project_manga_id"] = None
+
+    projects = load_projects()
+
+    # Render project selection list (click to select).
+    if projects:
+        st.sidebar.caption("Click a project to select it.")
+        for proj in projects:
+            manga_id = str(proj.get("manga_id") or "").strip()
+            display_name = str(proj.get("display_name") or "")
+            language = str(proj.get("language") or "")
+            chapters_completed = proj.get("chapters_completed") or []
+            try:
+                chapters_count = len(chapters_completed)
+            except Exception:
+                chapters_count = 0
+
+            label = (
+                f"{display_name} ({language}) — {chapters_count} chapters completed"
+            )
+            if st.sidebar.button(label, key=f"proj_btn_{manga_id}"):
+                st.session_state["selected_project_manga_id"] = manga_id
+
+    new_project_clicked = st.sidebar.button("New Project")
+    if new_project_clicked:
+        st.session_state["show_new_project_form"] = True
+
+    if st.session_state.get("show_new_project_form"):
+        with st.sidebar.form("new_project_form", clear_on_submit=True):
+            display_name = st.text_input("Display Name")
+            language = st.selectbox("Language", options=["Japanese", "Korean"])
+            submitted = st.form_submit_button("Create Project")
+
+            if submitted:
+                manga_id = (
+                    str(display_name).lower().replace(" ", "_").strip()
+                    or ""
+                )
+                try:
+                    create_project(
+                        manga_id=manga_id,
+                        display_name=str(display_name).strip(),
+                        language=language,
+                    )
+                except Exception as exc:
+                    st.sidebar.error(f"Failed to create project: {exc}")
+                else:
+                    st.session_state["selected_project_manga_id"] = manga_id
+                    st.session_state["show_new_project_form"] = False
+                    st.rerun()
+
+    selected_manga_id = st.session_state.get("selected_project_manga_id")
+    if not selected_manga_id:
+        st.info("Select a project from the sidebar to run the pipeline.")
+        return
 
     try:
-        _load_characters_on_startup()
+        _load_characters_for_manga(str(selected_manga_id))
     except Exception as exc:
         st.error(f"Failed to load character profiles: {exc}")
+        return
 
-    settings = _sidebar()
-    st.session_state["bubble_type"] = settings["bubble_type"]
+    st.subheader("Upload Chapter JSON")
 
-    st.divider()
+    uploaded_file = st.file_uploader("chapter.json", type=["json"])
 
-    raw_text = st.text_area(
-        "Enter Raw Japanese Manga Script",
-        placeholder=(
-            "Paste raw Japanese manga dialogue here...\n"
-            "e.g. たとえ天が崩れ落ちようとも、私は一歩も退かない。"
-        ),
-        height=150,
-    )
+    if uploaded_file is None:
+        st.info("Upload a chapter JSON containing a `panels` array.")
+        return
 
-    run_clicked = st.button("🚀 Run Localization Pipeline", type="primary")
+    try:
+        chapter_data = json.load(uploaded_file)
+    except Exception as exc:
+        st.error(f"Invalid JSON file: {exc}")
+        return
 
+    run_clicked = st.button("🚀 Run Pipeline", type="primary")
     if run_clicked:
-        if not raw_text.strip():
-            st.error("Please paste some script text before running the pipeline.")
-            return
-
         try:
             client = get_client()
         except Exception as exc:
             st.error(f"Failed to initialize Groq client: {exc}")
             return
 
-        with st.spinner("Pipeline running... this may take 30 seconds"):
+        chapter_data["manga_id"] = str(selected_manga_id)
+        with st.spinner("Pipeline running... this may take a while"):
             try:
-                result = run_pipeline(
-                    raw_text=raw_text.strip(),
-                    character_name=settings["character_name"],
-                    bubble_type=settings["bubble_type"],
-                    client=client,
-                )
+                results = process_chapter(chapter_data, client)
             except Exception as exc:
                 st.error(f"Pipeline error: {exc}")
                 return
 
-        st.session_state["last_result"] = result
-        st.session_state["last_raw_text"] = raw_text.strip()
+        st.session_state["chapter_results"] = results
 
-    # Render results (if present)
-    if "last_result" in st.session_state and "last_raw_text" in st.session_state:
+    if "chapter_results" in st.session_state:
+        results = st.session_state["chapter_results"]
         st.divider()
-        st.subheader("Results")
-        _results_tabs(st.session_state["last_raw_text"], st.session_state["last_result"])
+        st.subheader("Per-Panel Results")
+
+        import html
+
+        # Map panel_id -> character so the results table can show character
+        # even though `process_chapter()` returns only required fields.
+        panel_id_to_character: dict[str, str] = {}
+        for panel in (chapter_data.get("panels") or []):
+            if not isinstance(panel, dict):
+                continue
+            pid = panel.get("panel_id") or panel.get("id") or panel.get("index")
+            pid_str = str(pid) if pid is not None else ""
+            character = str(panel.get("character") or "").strip()
+            if pid_str:
+                panel_id_to_character[pid_str] = character
+
+        header_html = (
+            "<tr>"
+            "<th>panel_id</th>"
+            "<th>character</th>"
+            "<th>original_japanese</th>"
+            "<th>final_output</th>"
+            "<th>scores</th>"
+            "<th>flagged</th>"
+            "</tr>"
+        )
+
+        rows_html = []
+        for r in results:
+            panel_id = html.escape(str(r.get("panel_id", "")))
+            character = html.escape(panel_id_to_character.get(str(r.get("panel_id", "")), ""))
+            original = html.escape(str(r.get("original", "")))
+            final_output = html.escape(str(r.get("final_output", "")))
+            scores_json = html.escape(
+                json.dumps(r.get("scores", {}), ensure_ascii=False)
+            )
+            flagged = bool(r.get("flagged"))
+            flagged_text = "FLAGGED" if flagged else "OK"
+            bg = "#ffcc80" if flagged else "transparent"
+
+            rows_html.append(
+                "<tr style=\"background-color: %s;\">" % bg
+                + f"<td>{panel_id}</td>"
+                + f"<td>{character}</td>"
+                + f"<td><pre style=\"margin:0;white-space:pre-wrap;\">{original}</pre></td>"
+                + f"<td><pre style=\"margin:0;white-space:pre-wrap;\">{final_output}</pre></td>"
+                + f"<td><pre style=\"margin:0;white-space:pre-wrap;\">{scores_json}</pre></td>"
+                + f"<td>{flagged_text}</td>"
+                + "</tr>"
+            )
+
+        table_html = (
+            "<table style=\"width:100%; border-collapse: collapse;\">"
+            + "<thead>" + header_html + "</thead>"
+            + "<tbody>" + "".join(rows_html) + "</tbody>"
+            + "</table>"
+        )
+
+        st.markdown(table_html, unsafe_allow_html=True)
+
+        st.divider()
+        st.download_button(
+            label="Download Results as JSON",
+            data=json.dumps(results, ensure_ascii=False, indent=2),
+            file_name="chapter_results.json",
+            mime="application/json",
+        )
 
 
 if __name__ == "__main__":

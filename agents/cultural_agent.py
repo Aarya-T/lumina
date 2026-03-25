@@ -68,12 +68,7 @@ class CulturalAdaptorAgent:
         # TODO: Ensure outputs remain consistent with character voice guidelines.
         raise NotImplementedError("Cultural adaptation logic is not implemented yet.")
 
-# NOTE: The original spec referenced `llama3-70b-8192`, which Groq has since
-# been decommissioned by Groq. This constant uses the current 70B Llama 3 model
-# recommended by Groq. If Groq updates models again, you can change this in one
-# place.
 MODEL_NAME = "llama-3.3-70b-versatile"
-
 
 def run_cultural_adaptor(raw_text: str, client: Groq) -> str:
     """
@@ -88,22 +83,32 @@ def run_cultural_adaptor(raw_text: str, client: Groq) -> str:
         Culturally adapted English text.
     """
     system_prompt = (
-        "You are a professional manga and webtoon localization writer.\n"
-        "Your task is to take the given English text, which may contain\n"
-        "literal translations of Japanese or Korean idioms, honorifics,\n"
-        "and culture-specific references, and rewrite it into natural,\n"
-        "culturally appropriate English dialogue.\n\n"
-        "Strict rules:\n"
-        "1. Identify any Japanese/Korean idioms, honorifics, references, or stiff phrasing.\n"
-        "2. Rewrite them into natural English equivalents that an English-native\n"
-        "   manga/webtoon reader would immediately understand.\n"
-        "3. Preserve the original meaning, emotion, intent, and tone (e.g., comedic,\n"
-        "   serious, dramatic, sarcastic, shy).\n"
-        "4. Keep the overall length roughly similar to the input (do not expand into\n"
-        "   long explanations or shorten it excessively).\n"
-        "5. Output ONLY the final rewritten dialogue text.\n"
-        "6. Do NOT include any explanations, analysis, notes, or formatting beyond the\n"
-        "   dialogue itself.\n"
+        "You are a cultural localization editor for manga and webtoon dialogue.\n"
+        "You receive English text that may be a literal translation from Japanese\n"
+        "or Korean.\n\n"
+        "Follow these rules exactly:\n"
+        "1) Identify Japanese/Korean idioms, cultural references, honorific-driven tone,\n"
+        "   or unnatural literal phrasing.\n"
+        "2) Rewrite into natural, culturally appropriate English equivalents.\n"
+        "3) Preserve original meaning, emotion, and tone.\n"
+        "4) Keep output length similar to input length.\n"
+        "5) Output only the rewritten dialogue.\n"
+        "6) Do not add explanations, notes, labels, or extra formatting.\n"
+        "7) Pay special attention to context-dependent Japanese phrases that change\n"
+        "   meaning based on situation:\n"
+        "   * 終わった in panic context = 'I'm done for' / 'I'm screwed'\n"
+        "     NOT 'it's finished' or 'it's wrapped up'\n"
+        "   * やばい = 'oh no' / 'this is bad' (negative) OR 'this is insane/amazing'\n"
+        "     (positive) — read context carefully\n"
+        "   * マジで = 'seriously?' / 'no way!' — preserve the shock\n"
+        "   * 死ぬ = often hyperbolic, not literal — translate as 'I'm dying here' /\n"
+        "     'this is killing me'\n"
+        "   Always ask: is this character happy or panicking? Let that determine the\n"
+        "   translation direction.\n"
+        "8) If the English input contains 'it's over' or 'finished' or 'wrapped up'\n"
+        "   as a short exclamation (1-4 words), check if it reads as panic or\n"
+        "   relief. Panic context → 'I'm done for!!' / 'I'm screwed!!' Relief\n"
+        "   context → keep as is.\n"
     )
 
     completion = client.chat.completions.create(
@@ -132,26 +137,16 @@ def grade_cultural_output(original: str, adapted: str, client: Groq) -> Dict[str
     - a `pass` boolean, which is True only if all scores are >= 7.
     """
     system_prompt = (
-        "You are an expert localization editor.\n"
-        "You will be given an ORIGINAL line of translated English text and\n"
-        "an ADAPTED line that attempts to make it sound natural to an\n"
-        "English-native manga/webtoon reader.\n\n"
-        "Your job is to grade the adaptation on three axes, each from 1 to 10:\n"
-        "- cultural_accuracy: How well the adapted line preserves cultural meaning\n"
-        "  and avoids mistranslating or erasing important nuance.\n"
-        "- tone_preservation: How well the emotional tone, attitude, and character\n"
-        "  voice of the original are preserved.\n"
-        "- naturalness: How natural and fluent the line sounds in English dialogue\n"
-        "  (for manga/webtoon readers).\n\n"
-        "Scoring rules:\n"
-        "- 1 is terrible, 10 is excellent.\n"
-        "- The final `pass` value must be true ONLY if all three scores are >= 7.\n\n"
-        "Output rules (IMPORTANT):\n"
-        "- Output ONLY a valid JSON object with the exact keys:\n"
-        "  cultural_accuracy, tone_preservation, naturalness, pass\n"
-        "- Example:\n"
-        '  {\"cultural_accuracy\": 8, \"tone_preservation\": 9, \"naturalness\": 8, \"pass\": true}\n'
-        "- Do NOT include any explanations, comments, or extra text.\n"
+        "You are a strict localization quality grader.\n"
+        "You will grade an adapted English dialogue line against the original line.\n\n"
+        "Score each metric from 1 to 10:\n"
+        "- cultural_accuracy: faithful handling of idioms/cultural references.\n"
+        "- tone_preservation: preserves emotion, attitude, and voice.\n"
+        "- naturalness: reads as fluent, natural English dialogue.\n\n"
+        "Set pass=true only when ALL three scores are >= 7.\n\n"
+        "Output ONLY valid JSON with exactly these keys:\n"
+        "cultural_accuracy, tone_preservation, naturalness, pass\n"
+        "No prose. No markdown. No extra keys.\n"
     )
 
     user_content = (
@@ -174,14 +169,11 @@ def grade_cultural_output(original: str, adapted: str, client: Groq) -> Dict[str
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
-        # Fallback in case the model does not strictly follow JSON instructions.
-        # In that case, mark as an automatic fail with minimal defaults.
         return {
             "cultural_accuracy": 0,
             "tone_preservation": 0,
             "naturalness": 0,
             "pass": False,
-            "raw_response": raw,
         }
 
     cultural_accuracy = int(parsed.get("cultural_accuracy", 0))

@@ -87,6 +87,8 @@ def run_typesetting_editor(
     text: str,
     bubble_type: str,
     client: Groq,
+    *,
+    bubble_char_limit: int | None = None,
 ) -> str:
     """
     Ensure the dialogue fits the specified bubble type's character limit.
@@ -102,7 +104,11 @@ def run_typesetting_editor(
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     config_path = os.path.join(project_root, "data", "bubble_config.json")
     config = load_bubble_config(config_path)
-    max_chars = _get_max_chars_for_bubble(bubble_type, config)
+    max_chars = (
+        int(bubble_char_limit)
+        if bubble_char_limit is not None
+        else _get_max_chars_for_bubble(bubble_type, config)
+    )
 
     if len(text) <= max_chars:
         return text
@@ -143,6 +149,8 @@ def grade_typesetting_output(
     final: str,
     bubble_type: str,
     client: Groq,
+    *,
+    bubble_char_limit: int | None = None,
 ) -> Dict[str, Any]:
     """
     Grade the typesetting output quality.
@@ -155,7 +163,11 @@ def grade_typesetting_output(
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     config_path = os.path.join(project_root, "data", "bubble_config.json")
     config = load_bubble_config(config_path)
-    max_chars = _get_max_chars_for_bubble(bubble_type, config)
+    max_chars = (
+        int(bubble_char_limit)
+        if bubble_char_limit is not None
+        else _get_max_chars_for_bubble(bubble_type, config)
+    )
 
     final_len = len(final)
     fits_constraint = 10 if final_len <= max_chars else 1
