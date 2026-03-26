@@ -9,6 +9,9 @@ from groq import Groq
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+FAST_MODEL = "llama-3.1-8b-instant"
+QUALITY_MODEL = "llama-3.3-70b-versatile"
+
 
 def load_environment() -> Groq:
     """

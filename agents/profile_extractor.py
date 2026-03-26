@@ -9,17 +9,19 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from groq import Groq
+from utils.groq_client import QUALITY_MODEL
 
 
 def extract_profiles(chapter_data: dict, client: Groq) -> list:
     """
-    Infer character profiles from a chapter JSON.
+    Infer character profiles from a chapter JSON containing pre-translated
+    English dialogue lines (grouped by character).
 
     Expected input shape:
       chapter_data["panels"] is a list of panel objects.
       Each panel should include:
         - "character": character name
-        - "text": dialogue line text
+        - "text": pre-translated English dialogue line text
         - (other optional fields are ignored here)
     """
     panels = chapter_data.get("panels") or []
@@ -36,7 +38,7 @@ def extract_profiles(chapter_data: dict, client: Groq) -> list:
 
     system_prompt = (
         "You are an expert manga/webtoon character profiling assistant.\n"
-        "You will be given multiple dialogue lines for ONE character.\n\n"
+        "You will be given multiple English dialogue lines for ONE character.\n\n"
         "Infer the character's:\n"
         "- personality (short description of demeanor)\n"
         "- speech_style (how they generally speak)\n"
@@ -57,7 +59,7 @@ def extract_profiles(chapter_data: dict, client: Groq) -> list:
         )
 
         completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=QUALITY_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},

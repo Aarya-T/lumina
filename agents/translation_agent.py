@@ -17,7 +17,7 @@ from groq import Groq
 
 # Ensure the project root is on sys.path so we can import local utilities.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.groq_client import load_environment  # type: ignore
+from utils.groq_client import FAST_MODEL, QUALITY_MODEL, load_environment  # type: ignore
 
 
 @dataclass
@@ -32,7 +32,7 @@ class TranslationAgentConfig:
 
 # NOTE: Original spec requested `llama3-70b-8192`, but that model has been
 # decommissioned by Groq. We use the current Groq 70B Llama 3 model instead.
-MODEL_NAME = "llama-3.3-70b-versatile"
+MODEL_NAME = QUALITY_MODEL
 
 
 def detect_language(text: str) -> str:
@@ -66,6 +66,127 @@ def detect_language(text: str) -> str:
     return "unknown"
 
 
+def translate_chapter_batch(panels: list, client: Groq) -> dict:
+    """
+    Translate all panel Japanese lines in one LLM call.
+
+    Args:
+        panels: List of panel dicts from a chapter JSON. Each panel should include:
+                 - panel_id (or id/index)
+                 - character (speaker name)
+                 - text (Japanese dialogue)
+        client: Initialized Groq client.
+
+    Returns:
+        Dict mapping panel_id (as string) -> translated English text.
+    """
+    items: list[tuple[str, str, str, str]] = []
+    for idx, panel in enumerate(panels):
+        if not isinstance(panel, dict):
+            continue
+
+        panel_id = panel.get("panel_id") or panel.get("id") or panel.get("index")
+        panel_id_str = str(panel_id if panel_id is not None else idx)
+
+        character = str(panel.get("character") or "").strip()
+        if not character:
+            character = "UNKNOWN"
+
+        text = str(panel.get("text") or "").strip()
+        if not text:
+            continue
+
+        # Try to read page info from the panel dict.
+        page_val = None
+        try:
+            page_val = panel.get("page")
+        except Exception:
+            page_val = None
+        if page_val is None:
+            try:
+                page_val = panel.get("page_number")
+            except Exception:
+                page_val = None
+        if page_val is None:
+            try:
+                page_val = panel.get("page_id")
+            except Exception:
+                page_val = None
+
+        if page_val is None:
+            page_key = "1"
+        else:
+            page_key = str(page_val)
+
+        items.append((panel_id_str, character, text, page_key))
+
+    if not items:
+        return {}
+
+    system_prompt = (
+        "You are a professional manga translator specializing in Japanese to English.\n"
+        "You will be given multiple Japanese dialogue lines for the same chapter.\n\n"
+        "Rules (IMPORTANT):\n"
+        "1) Read ALL lines first to understand full scene context and conversation flow.\n"
+        "2) Then translate each line individually.\n"
+        "3) Preserve speaker identity. Each line is labeled with panel_id and the character.\n"
+        "4) Output ONLY a single strict JSON object.\n"
+        "5) JSON keys MUST exactly match the panel_id strings from the input.\n"
+        "6) JSON values MUST be the translated English dialogue for that panel.\n"
+    )
+
+    panel_page_groups: dict[str, list[tuple[str, str, str]]] = {}
+    page_order: list[str] = []
+
+    for panel_id_str, character, text, page_key in items:
+        if page_key not in panel_page_groups:
+            panel_page_groups[page_key] = []
+            page_order.append(page_key)
+        panel_page_groups[page_key].append((panel_id_str, character, text))
+
+    preamble = (
+        "You are translating a manga chapter.\n"
+        "Read ALL lines below first to understand the full scene and character relationships\n"
+        "before translating any line.\n"
+        "Each line shows: [panel_id] CHARACTER: japanese_text\n"
+        "Translate preserving emotional state and who is speaking TO whom.\n"
+    )
+
+    user_content_lines: list[str] = [preamble.rstrip()]
+    for page_key in page_order:
+        user_content_lines.append(f"--- Page {page_key} ---")
+        for panel_id_str, character, text in panel_page_groups[page_key]:
+            user_content_lines.append(f"[{panel_id_str}] {character}: {text}")
+
+    user_content = "\n".join(user_content_lines).strip()
+
+    completion = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+    )
+
+    raw = (completion.choices[0].message.content or "").strip()
+    try:
+        import json
+
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+
+    if not isinstance(parsed, dict):
+        return {}
+
+    result: dict[str, str] = {}
+    for k, v in parsed.items():
+        if v is None:
+            continue
+        result[str(k)] = str(v).strip()
+    return result
+
+
 def run_translation_agent(
     raw_text: str,
     client: Groq,
@@ -95,27 +216,18 @@ def run_translation_agent(
         "  * Feminine speech (e.g., watashi, kashira) → soft, feminine English.\n"
         "- Preserve the FEELING of Japanese honorifics (like -san, -kun, -sama) as respect levels,\n"
         "  but do NOT include the honorific words themselves in the output.\n"
-        "- For ambiguous phrases, always consider emotional context:\n"
-        "  * 終わった said by someone in distress =\n"
-        "    'I'm done for' / 'I'm screwed' / 'It's over for me'\n"
-        "    NOT 'it's finished' or 'it's wrapped up'\n"
-        "  * 決まりね？ = 'So it's settled then?' / 'That's decided?'\n"
-        "    — always a question when it ends with ね？\n"
-        "  * ぼっち = 'loner' — always preserve this word or concept,\n"
-        "    never replace with generic anxiety references\n"
-        "  * なら私が出してあげる after ふふっ =\n"
-        "    'Hehe, I'll treat you' / 'I'll cover it, teehee'\n"
-        "    — preserve the playful feminine offer\n"
-        "  * はずだった = narrative irony callback meaning\n"
-        "    'or so I thought' / 'that was the plan, anyway' /\n"
-        "    '...supposedly' — always preserve the ironic disappointed tone,\n"
-        "    never translate as neutral past tense\n"
-        "- Never confuse the speaker. The dialogue line belongs to the character named in the panel.\n"
-        "  * なら私が〜してあげる = 'Then I'll [do X] for you' —\n"
-        "    私 (I/me) is the SPEAKER offering something TO someone else.\n"
-        "    Never translate as the speaker receiving something.\n"
-        "  * あげる after a verb = the speaker is giving/doing for others,\n"
-        "    not receiving.\n"
+        "- Before translating, identify the speaker's emotional state: panicking / happy / sad /\n"
+        "  angry / teasing / casual farewell / ironic.\n"
+        "- Let emotional state drive word choice:\n"
+        "  * Panic phrases → desperate English equivalents\n"
+        "  * Ironic narrator lines → preserve the irony with phrases like\n"
+        "    'or so I thought' / 'at least that was the plan'\n"
+        "  * Casual farewells → 'later' / 'see ya' / 'catch you later'\n"
+        "  * Offers and giving phrases → preserve who is giving and who is receiving,\n"
+        "    never reverse them\n"
+        "  * Definitive statements → translate as confident, not hesitant\n"
+        "    (never add 'I guess' / 'I suppose' to a character who spoke with conviction)\n"
+        "- Never soften strong emotions or add uncertainty to confident statements\n"
         "- Do NOT include any romaji, Japanese script, explanations, translation notes, or comments.\n"
         "- Output ONLY the translated English dialogue text, with no extra lines.\n"
     )

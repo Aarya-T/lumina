@@ -17,7 +17,7 @@ from groq import Groq
 
 # Make the project root importable so we can access local packages and data files.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.groq_client import load_environment  # type: ignore
+from utils.groq_client import FAST_MODEL, QUALITY_MODEL, load_environment  # type: ignore
 
 
 @dataclass
@@ -45,7 +45,7 @@ class TypesettingEditorAgent:
 
 # NOTE: Original spec requested `llama3-70b-8192`, but that model has been
 # decommissioned. We use the current Groq 70B Llama 3 model instead.
-MODEL_NAME = "llama-3.3-70b-versatile"
+MODEL_NAME = QUALITY_MODEL
 
 
 def load_bubble_config(config_path: str) -> Dict[str, Any]:
@@ -156,9 +156,9 @@ def grade_typesetting_output(
     Grade the typesetting output quality.
 
     Metrics:
-    - fits_constraint (1-10) — based on actual character count.
-    - meaning_preserved (1-10).
-    - voice_maintained (1-10).
+    - fits_constraint (1-10) — hard rule based on actual character count.
+    - meaning_preserved (1-10) — LLM-only check for meaning preservation.
+    - voice_maintained: not checked here (handled by continuity agent).
     """
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     config_path = os.path.join(project_root, "data", "bubble_config.json")
@@ -173,19 +173,18 @@ def grade_typesetting_output(
     fits_constraint = 10 if final_len <= max_chars else 1
 
     system_prompt = (
-        "You are an expert localization editor focusing on typesetting.\n"
+        "You are an expert localization editor focusing on meaning preservation.\n"
         "You will receive the ORIGINAL continuity-approved dialogue and the FINAL\n"
         "typeset-safe dialogue.\n\n"
-        "Your job is to grade the FINAL text on two axes, from 1 to 10:\n"
-        "- meaning_preserved: How well the meaning of the ORIGINAL is preserved.\n"
-        "- voice_maintained: How well the character's voice, tone, and style are preserved.\n\n"
+        "Your job is to grade meaning_preserved from 1 to 10:\n"
+        "- meaning_preserved: How well the meaning of the ORIGINAL is preserved in the FINAL.\n\n"
         "Scoring rules:\n"
         "- 1 is terrible, 10 is excellent.\n\n"
         "Output rules (IMPORTANT):\n"
         "- Output ONLY a valid JSON object with the exact keys:\n"
-        "  meaning_preserved, voice_maintained\n"
+        "  meaning_preserved\n"
         "- Example:\n"
-        '  {\"meaning_preserved\": 9, \"voice_maintained\": 8}\n'
+        '  {\"meaning_preserved\": 9}\n'
         "- Do NOT include any explanations, comments, or extra text.\n"
     )
 
@@ -197,7 +196,7 @@ def grade_typesetting_output(
     )
 
     completion = client.chat.completions.create(
-        model=MODEL_NAME,
+        model=FAST_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
@@ -209,27 +208,24 @@ def grade_typesetting_output(
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
+        meaning_preserved = 0
+        passed = False
         return {
             "fits_constraint": fits_constraint,
-            "meaning_preserved": 0,
-            "voice_maintained": 0,
-            "pass": False,
+            "meaning_preserved": meaning_preserved,
+            "voice_maintained": None,
+            "pass": passed,
             "raw_response": raw,
         }
 
     meaning_preserved = int(parsed.get("meaning_preserved", 0))
-    voice_maintained = int(parsed.get("voice_maintained", 0))
-
-    passed = (
-        fits_constraint >= 7
-        and meaning_preserved >= 7
-        and voice_maintained >= 7
-    )
+    fits = fits_constraint >= 7
+    passed = fits and meaning_preserved >= 7
 
     return {
         "fits_constraint": fits_constraint,
         "meaning_preserved": meaning_preserved,
-        "voice_maintained": voice_maintained,
+        "voice_maintained": None,
         "pass": passed,
     }
 

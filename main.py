@@ -11,6 +11,7 @@ from agents.continuity_agent import (
 from agents.translation_agent import (
     detect_language,
     grade_translation_output,
+    translate_chapter_batch,
     run_translation_agent,
 )
 from agents.typesetting_agent import (
@@ -298,23 +299,9 @@ def process_chapter(chapter_data: Dict[str, Any], client: Groq) -> list[Dict[str
 
     panels = chapter_data.get("panels") or []
 
-    # Optional upfront profiling: enrich/merge character voice rules for continuity.
-    try:
-        inferred_profiles = extract_profiles(chapter_data, client)
-        for profile in inferred_profiles:
-            character_name = str(profile.get("name") or "").strip()
-            if not character_name:
-                continue
-            update_or_create_profile(
-                character_name=character_name,
-                new_profile=profile,
-                vector_store=vector_store,
-                manga_id=manga_id,
-            )
-    except Exception as exc:
-        print(f"[ProcessChapter] Profile extraction failed (continuing anyway): {exc}")
-
-    results: list[Dict[str, Any]] = []
+    # Collect panel jobs first so we can run Step 0 translation across ALL panels
+    # before extracting/updating character profiles.
+    panel_jobs: list[Dict[str, Any]] = []
     for panel in panels:
         if not isinstance(panel, dict):
             continue
@@ -323,16 +310,91 @@ def process_chapter(chapter_data: Dict[str, Any], client: Groq) -> list[Dict[str
         panel_id = str(panel_id) if panel_id is not None else ""
 
         character_name = str(panel.get("character") or "").strip()
-        original = str(panel.get("text") or "")
-        if not character_name or not original:
+        original_japanese = str(panel.get("text") or "")
+        if not character_name or not original_japanese:
             continue
 
         skip_continuity = character_name in ("NARRATION", "TEACHER", "STUDENT")
 
         bubble_char_limit = panel.get("bubble_char_limit")
-        bubble_char_limit = int(bubble_char_limit) if bubble_char_limit is not None else None
+        bubble_char_limit = (
+            int(bubble_char_limit) if bubble_char_limit is not None else None
+        )
 
         bubble_type = str(panel.get("bubble_type") or "medium").strip()
+
+        panel_jobs.append(
+            {
+                "panel_id": panel_id,
+                "character_name": character_name,
+                "original_japanese": original_japanese,
+                "skip_continuity": skip_continuity,
+                "bubble_type": bubble_type,
+                "bubble_char_limit": bubble_char_limit,
+            }
+        )
+
+    # STEP 0 — Batch translate ALL panels first.
+    try:
+        translation_results: Dict[str, str] = translate_chapter_batch(panels, client)
+    except Exception as exc:
+        print(f"[ProcessChapter] Batch translation failed: {exc}")
+        translation_results = {}
+
+    translated_outputs: list[str] = []
+    translation_scores_by_panel: list[Dict[str, Any]] = []
+    translated_lines_by_character: Dict[str, list[str]] = {}
+
+    fixed_batch_translation_score = {"batch_translated": True, "pass": True}
+
+    for job in panel_jobs:
+        panel_id = job["panel_id"]
+        character_name = job["character_name"]
+        original_japanese = job["original_japanese"]
+
+        translated_output = translation_results.get(panel_id) or original_japanese
+
+        translated_outputs.append(translated_output)
+        translation_scores_by_panel.append(fixed_batch_translation_score)
+        translated_lines_by_character.setdefault(character_name, []).append(
+            translated_output
+        )
+
+    # Extract character profiles from translated English dialogue.
+    chapter_for_profiles = {"panels": []}
+    for character_name, lines in translated_lines_by_character.items():
+        for line in lines:
+            chapter_for_profiles["panels"].append(
+                {"character": character_name, "text": line}
+            )
+
+    try:
+        inferred_profiles = extract_profiles(chapter_for_profiles, client)
+        for profile in inferred_profiles:
+            inferred_character_name = str(profile.get("name") or "").strip()
+            if not inferred_character_name:
+                continue
+            update_or_create_profile(
+                character_name=inferred_character_name,
+                new_profile=profile,
+                vector_store=vector_store,
+                manga_id=manga_id,
+            )
+    except Exception as exc:
+        print(f"[ProcessChapter] Profile extraction failed (continuing anyway): {exc}")
+
+    # Run Steps A/B/C per panel using the already-translated English.
+    results: list[Dict[str, Any]] = []
+    for i, job in enumerate(panel_jobs):
+        panel_id = job["panel_id"]
+        character_name = job["character_name"]
+        original_japanese = job["original_japanese"]
+        skip_continuity = job["skip_continuity"]
+        bubble_type = job["bubble_type"]
+        bubble_char_limit = job["bubble_char_limit"]
+
+        translated_output = translated_outputs[i]
+        translation_scores = translation_scores_by_panel[i]
 
         character_profile = query_character_profile_dict(
             character_name,
@@ -347,7 +409,7 @@ def process_chapter(chapter_data: Dict[str, Any], client: Groq) -> list[Dict[str
         character_profile["manga_id"] = manga_id
 
         pipeline_result = run_pipeline(
-            raw_text=original,
+            raw_text=translated_output,
             character_name=character_name,
             bubble_type=bubble_type,
             client=client,
@@ -358,19 +420,18 @@ def process_chapter(chapter_data: Dict[str, Any], client: Groq) -> list[Dict[str
 
         final_output = pipeline_result.get("final_output", "")
         scores = {
-            "translation": pipeline_result.get("translation_scores"),
+            "translation": translation_scores,
             "cultural": pipeline_result.get("cultural_scores"),
             "continuity": pipeline_result.get("continuity_scores"),
             "typesetting": pipeline_result.get("typesetting_scores"),
         }
         flagged = _flagged_from_scores(scores)
 
-        # Store approved output for later continuity.
         add_approved_line(
             panel_id=panel_id,
             character_name=character_name,
             manga_id=manga_id,
-            original_japanese=original,
+            original_japanese=original_japanese,
             final_output=final_output,
             scores=scores,
         )
@@ -378,7 +439,7 @@ def process_chapter(chapter_data: Dict[str, Any], client: Groq) -> list[Dict[str
         results.append(
             {
                 "panel_id": panel_id,
-                "original": original,
+                "original": original_japanese,
                 "final_output": final_output,
                 "scores": scores,
                 "flagged": flagged,
