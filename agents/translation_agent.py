@@ -66,7 +66,11 @@ def detect_language(text: str) -> str:
     return "unknown"
 
 
-def run_translation_agent(raw_text: str, client: Groq) -> str:
+def run_translation_agent(
+    raw_text: str,
+    client: Groq,
+    character_name: str = "",
+) -> str:
     """
     Run the Translation Agent on a raw Japanese line.
 
@@ -102,6 +106,10 @@ def run_translation_agent(raw_text: str, client: Groq) -> str:
         "  * なら私が出してあげる after ふふっ =\n"
         "    'Hehe, I'll treat you' / 'I'll cover it, teehee'\n"
         "    — preserve the playful feminine offer\n"
+        "  * はずだった = narrative irony callback meaning\n"
+        "    'or so I thought' / 'that was the plan, anyway' /\n"
+        "    '...supposedly' — always preserve the ironic disappointed tone,\n"
+        "    never translate as neutral past tense\n"
         "- Never confuse the speaker. The dialogue line belongs to the character named in the panel.\n"
         "  * なら私が〜してあげる = 'Then I'll [do X] for you' —\n"
         "    私 (I/me) is the SPEAKER offering something TO someone else.\n"
@@ -115,8 +123,13 @@ def run_translation_agent(raw_text: str, client: Groq) -> str:
     # Provide detected language as context in the user message.
     user_content = (
         f"Detected language (heuristic): {language}\n"
-        "Source dialogue:\n"
-        f"{raw_text}\n"
+        + (
+            f"SPEAKER: {character_name} — this line is spoken BY {character_name}, not to them.\n"
+            if character_name
+            else ""
+        )
+        + "Source dialogue:\n"
+        + f"{raw_text}\n"
     )
 
     completion = client.chat.completions.create(

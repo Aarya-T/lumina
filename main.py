@@ -124,6 +124,7 @@ def run_pipeline(
     *,
     bubble_char_limit: int | None = None,
     character_profile: Dict[str, Any] | None = None,
+    skip_continuity: bool = False,
 ) -> Dict[str, Any]:
     """
     Run the full Lumina Pipeline on a single line of script.
@@ -143,7 +144,11 @@ def run_pipeline(
     if detected_language in ("korean", "japanese"):
         translation_result = _run_with_retries(
             "Step 0 (Translation Agent)",
-            run_fn=lambda: run_translation_agent(raw_text, client),
+            run_fn=lambda: run_translation_agent(
+                raw_text,
+                client,
+                character_name=character_name,
+            ),
             grade_fn=lambda translated: grade_translation_output(
                 original=raw_text,
                 translated=translated,
@@ -192,22 +197,33 @@ def run_pipeline(
     cultural_scores = cultural_result["scores"]
 
     # STEP B — Continuity Check (Agent 2)
-    continuity_result = _run_with_retries(
-        "Agent 2 (Continuity Director)",
-        run_fn=lambda: run_continuity_director(
-            cultural_output,
-            character_profile,
-            client,
-        ),
-        grade_fn=lambda continuity_text: grade_continuity_output(
-            adapted_text=cultural_output,
-            continuity_text=continuity_text,
-            character_name=character_name,
-            client=client,
-        ),
-    )
-    continuity_output = continuity_result["output"]
-    continuity_scores = continuity_result["scores"]
+    if skip_continuity:
+        # These are not tracked characters; grading against a voice profile is meaningless.
+        continuity_output = cultural_output
+        continuity_scores = {
+            "voice_consistency": 10,
+            "forbidden_phrase_compliance": 10,
+            "meaning_preservation": 10,
+            "pass": True,
+            "skipped": True,
+        }
+    else:
+        continuity_result = _run_with_retries(
+            "Agent 2 (Continuity Director)",
+            run_fn=lambda: run_continuity_director(
+                cultural_output,
+                character_profile,
+                client,
+            ),
+            grade_fn=lambda continuity_text: grade_continuity_output(
+                adapted_text=cultural_output,
+                continuity_text=continuity_text,
+                character_name=character_name,
+                client=client,
+            ),
+        )
+        continuity_output = continuity_result["output"]
+        continuity_scores = continuity_result["scores"]
 
     # STEP C — Typesetting (Agent 3)
     typesetting_result = _run_with_retries(
@@ -311,6 +327,8 @@ def process_chapter(chapter_data: Dict[str, Any], client: Groq) -> list[Dict[str
         if not character_name or not original:
             continue
 
+        skip_continuity = character_name in ("NARRATION", "TEACHER", "STUDENT")
+
         bubble_char_limit = panel.get("bubble_char_limit")
         bubble_char_limit = int(bubble_char_limit) if bubble_char_limit is not None else None
 
@@ -335,6 +353,7 @@ def process_chapter(chapter_data: Dict[str, Any], client: Groq) -> list[Dict[str
             client=client,
             bubble_char_limit=bubble_char_limit,
             character_profile=character_profile,
+            skip_continuity=skip_continuity,
         )
 
         final_output = pipeline_result.get("final_output", "")
