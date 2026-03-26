@@ -16,7 +16,7 @@ from groq import Groq
 
 # Make the project root importable so we can access local packages.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.groq_client import load_environment  # type: ignore
+from utils.groq_client import FAST_MODEL, QUALITY_MODEL, load_environment  # type: ignore
 from memory.vector_store import (
     query_character_profile,
     query_character_profile_dict,
@@ -49,7 +49,7 @@ class ContinuityDirectorAgent:
 
 # NOTE: Original spec requested `llama3-70b-8192`, but that model has been
 # decommissioned. We use the current Groq 70B Llama 3 model instead.
-MODEL_NAME = "llama-3.3-70b-versatile"
+MODEL_NAME = QUALITY_MODEL
 
 
 def _build_character_prompt_snippet(
@@ -241,7 +241,7 @@ def grade_continuity_output(
     user_content = "\n".join(user_parts)
 
     completion = client.chat.completions.create(
-        model=MODEL_NAME,
+        model=FAST_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},

@@ -18,7 +18,7 @@ from groq import Groq
 
 # Ensure the project root is on sys.path so we can import local packages.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.groq_client import load_environment
+from utils.groq_client import FAST_MODEL, QUALITY_MODEL, load_environment
 
 # TODO: Import CrewAI Agent/Task abstractions when integrating with orchestration.
 # from crewai import Agent
@@ -68,7 +68,7 @@ class CulturalAdaptorAgent:
         # TODO: Ensure outputs remain consistent with character voice guidelines.
         raise NotImplementedError("Cultural adaptation logic is not implemented yet.")
 
-MODEL_NAME = "llama-3.3-70b-versatile"
+MODEL_NAME = QUALITY_MODEL
 
 def run_cultural_adaptor(raw_text: str, client: Groq) -> str:
     """
@@ -94,21 +94,10 @@ def run_cultural_adaptor(raw_text: str, client: Groq) -> str:
         "4) Keep output length similar to input length.\n"
         "5) Output only the rewritten dialogue.\n"
         "6) Do not add explanations, notes, labels, or extra formatting.\n"
-        "7) Pay special attention to context-dependent Japanese phrases that change\n"
-        "   meaning based on situation:\n"
-        "   * 終わった in panic context = 'I'm done for' / 'I'm screwed'\n"
-        "     NOT 'it's finished' or 'it's wrapped up'\n"
-        "   * やばい = 'oh no' / 'this is bad' (negative) OR 'this is insane/amazing'\n"
-        "     (positive) — read context carefully\n"
-        "   * マジで = 'seriously?' / 'no way!' — preserve the shock\n"
-        "   * 死ぬ = often hyperbolic, not literal — translate as 'I'm dying here' /\n"
-        "     'this is killing me'\n"
-        "   Always ask: is this character happy or panicking? Let that determine the\n"
-        "   translation direction.\n"
-        "8) If the English input contains 'it's over' or 'finished' or 'wrapped up'\n"
-        "   as a short exclamation (1-4 words), check if it reads as panic or\n"
-        "   relief. Panic context → 'I'm done for!!' / 'I'm screwed!!' Relief\n"
-        "   context → keep as is.\n"
+        "8) If the input already reads as natural correct English with clear\n"
+        "   meaning and correct speaker attribution — preserve it. Only rewrite\n"
+        "   when there is a genuine cultural equivalence improvement to make.\n"
+        "   Never change who is speaking or who is receiving an action.\n"
     )
 
     completion = client.chat.completions.create(
@@ -157,7 +146,7 @@ def grade_cultural_output(original: str, adapted: str, client: Groq) -> Dict[str
     )
 
     completion = client.chat.completions.create(
-        model=MODEL_NAME,
+        model=FAST_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
